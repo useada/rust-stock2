@@ -9,9 +9,13 @@ use std::{
 };
 
 use chrono::{DateTime, Local}; // 时间 library
-use http_req::request; // 网络 library
+// use http_req::request; // 网络 library
+use http_req::{request::Request, uri::Uri, response::Headers, error};
+use http_req::response::Response;
 use serde::{Deserialize, Serialize}; // 序列化 library
 use serde_json::{json, Map, Value}; // 序列化 library
+use encoding_rs::GBK;
+
 /**
 tui：一款超好用的跨平台命令行界面库
 使用 tui.rs 提供的以下模块进行 UI 编写(所有 UI 元素都实现了 Widget 或 StatefuWidget Trait)：
@@ -160,51 +164,65 @@ impl App {
         if codes.len() > 0 {
             thread::spawn(move || {
                 let mut writer = Vec::new();
-                let ret = request::get(
-                    format!("{}{}", "http://api.money.126.net/data/feed/", codes),
-                    &mut writer,
-                );
+                // let ret = request::get(
+                //     format!("{}{}", "http://api.money.126.net/data/feed/", codes),
+                //     &mut writer,
+                // );
+                let ret = get_stock_info(codes, &mut writer);
                 let mut locked_err = err_clone.lock().unwrap();
                 if let Err(err) = ret {
                     *locked_err = format!("{:?}", err);
                 } else {
-                    let content = String::from_utf8_lossy(&writer);
-                    if content.starts_with("_ntes_quote_callback") {
+                    // let content = String::from_utf8_lossy(&writer);
+                    let content = gbk_to_utf8(&writer);
+                    if content.starts_with("var hq_str_") {
                         let mut stocks = stock_clone.lock().unwrap();
                         // 网易的返回包了一个js call，用skip,take,collect实现一个substring剥掉它
-                        let json: Map<String, Value> = serde_json::from_str(
-                            &content
-                                .chars()
-                                .skip(21)
-                                .take(content.len() - 23)
-                                .collect::<String>(),
-                        )
-                        .unwrap();
+                        // let json: Map<String, Value> = serde_json::from_str(
+                        //     &content
+                        //         .chars()
+                        //         .skip(21)
+                        //         .take(content.len() - 23)
+                        //         .collect::<String>(),
+                        // )
+                        // .unwrap();
                         for stock in stocks.iter_mut() {
                             // 如果code不对,返回的json里不包括这个对象, 用unwrap_or生成一个空对象,防止异常
-                            let obj = json
-                                .get(&stock.code)
-                                .unwrap_or(&json!({}))
-                                .as_object()
-                                .unwrap()
-                                .to_owned();
-                            stock.title = obj
-                                .get("name")
-                                .unwrap_or(&json!(stock.code.clone()))
-                                .as_str()
-                                .unwrap()
-                                .to_owned();
-                            stock.price = obj.get("price").unwrap_or(&json!(0.0)).as_f64().unwrap();
-                            stock.percent =
-                                obj.get("percent").unwrap_or(&json!(0.0)).as_f64().unwrap();
-                            stock.open = obj.get("open").unwrap_or(&json!(0.0)).as_f64().unwrap();
-                            stock.yestclose = obj
-                                .get("yestclose")
-                                .unwrap_or(&json!(0.0))
-                                .as_f64()
-                                .unwrap();
-                            stock.high = obj.get("high").unwrap_or(&json!(0.0)).as_f64().unwrap();
-                            stock.low = obj.get("low").unwrap_or(&json!(0.0)).as_f64().unwrap();
+                            let s = content.chars().skip(21).collect::<String>();
+                            let result = split_by_comma(s.as_str());
+
+                            // let title= gbk_to_utf8(result[0].to_string().as_bytes());
+                            stock.title = result[0].to_string();
+                            stock.open = result[1].parse::<f64>().unwrap();
+                            stock.yestclose = result[2].parse::<f64>().unwrap();
+                            stock.price = result[3].parse::<f64>().unwrap();
+                            stock.high = result[4].parse::<f64>().unwrap();
+                            stock.low = result[5].parse::<f64>().unwrap();
+                            stock.percent = stock.price / stock.open - 1.0;
+
+                            // let obj = json
+                            //     .get(&stock.code)
+                            //     .unwrap_or(&json!({}))
+                            //     .as_object()
+                            //     .unwrap()
+                            //     .to_owned();
+                            // stock.title = obj
+                            //     .get("name")
+                            //     .unwrap_or(&json!(stock.code.clone()))
+                            //     .as_str()
+                            //     .unwrap()
+                            //     .to_owned();
+                            // stock.price = obj.get("price").unwrap_or(&json!(0.0)).as_f64().unwrap();
+                            // stock.percent =
+                            //     obj.get("percent").unwrap_or(&json!(0.0)).as_f64().unwrap();
+                            // stock.open = obj.get("open").unwrap_or(&json!(0.0)).as_f64().unwrap();
+                            // stock.yestclose = obj
+                            //     .get("yestclose")
+                            //     .unwrap_or(&json!(0.0))
+                            //     .as_f64()
+                            //     .unwrap();
+                            // stock.high = obj.get("high").unwrap_or(&json!(0.0)).as_f64().unwrap();
+                            // stock.low = obj.get("low").unwrap_or(&json!(0.0)).as_f64().unwrap();
 
                             // if json.contains_key(&stock.code) {
                             //     let mut writer2 = Vec::new();
@@ -220,7 +238,9 @@ impl App {
                         *last_refresh = Local::now();
                         *locked_err = String::new();
                     } else {
-                        *locked_err = String::from("服务器返回错误");
+                        // *locked_err = String::from("服务器返回错误");
+                        // println!("{:?}", content);
+                        *locked_err = String::from(content)
                     }
                 }
             });
@@ -238,4 +258,32 @@ impl App {
             .collect();
         codes.join(",")
     }
+}
+
+
+fn get_stock_info(codes: String, writer: &mut Vec<u8>) -> Result<Response, error::Error> {
+    let str = format!("{}{}", "https://hq.sinajs.cn/list=", codes);
+    let uri = Uri::try_from(str.as_str()).unwrap();
+
+    let mut headers = Headers::new();
+    headers.insert("Accept-Charset", "utf-8");
+    headers.insert("Accept-Language", "zh-CN,zh;q=0.9");
+    headers.insert("Host", "hq.sinajs.cn");
+    headers.insert("Connection", "keep-alive");
+    headers.insert("content-type", "application/javascript; charset=GB18030");
+    headers.insert("Referer", "https://finance.sina.com.cn");
+    headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36");
+
+    Request::new(&uri)
+        .headers(headers)
+        .send(writer)
+}
+
+fn split_by_comma(input: &str) -> Vec<&str> {
+    input.split(',').collect()
+}
+
+fn gbk_to_utf8(input: &[u8]) -> String {
+    let (cow, _, _) = GBK.decode(input);
+    cow.to_string()
 }
